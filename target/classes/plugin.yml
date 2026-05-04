@@ -1,0 +1,22 @@
+name: FlorestRollback
+version: '1.0'
+main: ru.florestdev.florestRollback.FlorestRollback
+api-version: '1.21'
+prefix: FlorestRollback
+load: STARTUP
+authors: [ FlorestDev ]
+description: Private FlorestMC's plugin on Rollback (CP analog for Folia)
+commands:
+  fr:
+    aliases:
+      - co
+      - cp
+      - fp
+      - otkat
+    description: Main command for inspection, rollback
+    permission: fr.use
+permissions:
+  fr.use:
+    description: Main permission
+    default: op
+folia-supported: true
