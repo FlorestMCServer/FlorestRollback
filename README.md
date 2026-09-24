@@ -16,5 +16,6 @@ Plugin on perfect rollback! better than CoreProtect for performance on Folia/oth
 	    <groupId>com.github.FlorestMCServer</groupId>
 	    <artifactId>FlorestRollback</artifactId>
 	    <version>1.3</version>
+		<scope>provided</scope>
 	</dependency>
 ```
