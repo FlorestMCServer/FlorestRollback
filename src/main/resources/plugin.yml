@@ -6,6 +6,7 @@ prefix: FlorestRollback
 load: STARTUP
 authors: [ FlorestDev ]
 description: Private FlorestMC's plugin on Rollback (CP analog for Folia)
+softdepend: [WorldEdit]
 commands:
   fr:
     aliases:
