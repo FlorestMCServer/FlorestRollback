@@ -54,26 +54,26 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
 
     private HikariDataSource dataSource;
 
-    // ==================== ОЧЕРЕДЬ С ГАРАНТИЕЙ ДОСТАВКИ ====================
+    // ==================== ОЧЕРЕДЬ ====================
     private final ConcurrentLinkedQueue<LogEntry> logQueue = new ConcurrentLinkedQueue<>();
     private final AtomicInteger queueSize = new AtomicInteger(0);
     private final AtomicBoolean isFlushing = new AtomicBoolean(false);
     private final Object dbLock = new Object();
 
-    private static final int MAX_QUEUE = 2_000_000;      // жёсткий лимит в памяти
+    private static final int MAX_QUEUE = 2_000_000;
     private static final int BATCH_SIZE = 5_000;
 
-    // WAL — журнал на диске для гарантии сохранности при краше/переполнении
+    // WAL
     private final Object walLock = new Object();
     private Path walPath;
     private BufferedWriter walWriter;
 
-    // Для массовых операций WorldEdit
+    // WorldEdit
     private final ThreadLocal<List<LogEntry>> batchBuffer = ThreadLocal.withInitial(ArrayList::new);
     private final AtomicInteger worldEditBatchDepth = new AtomicInteger(0);
     private final AtomicInteger worldEditTotalLogged = new AtomicInteger(0);
 
-    // Кэш для инспекторов
+    // Инспекторы
     private final Set<UUID> inspectors = Collections.synchronizedSet(new HashSet<>());
 
     // Статистика
@@ -83,7 +83,7 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
     // Кэш BlockData
     private final Map<String, BlockData> blockDataCache = new ConcurrentHashMap<>();
 
-    // Отслеживание открытых контейнеров для логирования изменений инвентаря
+    // Открытые контейнеры
     private final Map<UUID, ContainerSession> openContainers = new ConcurrentHashMap<>();
 
     public static FlorestRollback getInstance() {
@@ -109,17 +109,14 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
             getLogger().warning("WorldEdit не найден — интеграция отключена");
         }
 
-        // Периодическая запись в БД
         Bukkit.getAsyncScheduler().runAtFixedRate(this, (task) -> flushQueueSafe(),
                 1, 2, TimeUnit.SECONDS);
 
-        // Автоочистка
         Bukkit.getAsyncScheduler().runAtFixedRate(this, (task) -> {
             long days = getConfig().getLong("logging.purge-after-days", 30);
             executePurge(TimeUnit.DAYS.toMillis(days));
         }, 1, 24, TimeUnit.HOURS);
 
-        // Мониторинг
         Bukkit.getAsyncScheduler().runAtFixedRate(this, (task) -> {
             if (queueSize.get() > MAX_QUEUE * 0.9) {
                 getLogger().warning("⚠️ Очередь почти переполнена: " + queueSize.get() + " / " + MAX_QUEUE);
@@ -169,24 +166,18 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
         }
     }
 
-    // ==================== WAL (гарантия сохранности) ====================
+    // ==================== WAL ====================
     private void setupWal() {
         try {
             Files.createDirectories(getDataFolder().toPath());
             walPath = getDataFolder().toPath().resolve("wal.log");
-            // Дописываем в конец (не перезаписываем)
             walWriter = new BufferedWriter(new FileWriter(walPath.toFile(), true));
-            // Восстанавливаем несохранённые записи из WAL при старте
             restoreFromWal();
         } catch (IOException e) {
             getLogger().log(Level.SEVERE, "❌ Не удалось инициализировать WAL", e);
         }
     }
 
-    /**
-     * Восстанавливает логи из WAL при старте сервера.
-     * Формат: player\tworld\tx\ty\tz\told\tnew\ttime\n
-     */
     private void restoreFromWal() {
         if (!Files.exists(walPath)) return;
         try {
@@ -204,7 +195,6 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
             if (restored > 0) {
                 getLogger().info("📼 Восстановлено из WAL: " + restored + " записей");
             }
-            // Очищаем WAL после успешного восстановления
             Files.write(walPath, new byte[0]);
         } catch (IOException e) {
             getLogger().log(Level.SEVERE, "❌ Ошибка восстановления из WAL", e);
@@ -223,16 +213,25 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
         }
     }
 
-    private void clearWal() {
+    /**
+     * Перезаписывает WAL только актуальными (ещё не сброшенными) записями.
+     * Вызывается после успешного коммита в БД.
+     */
+    private void rewriteWal() {
         synchronized (walLock) {
             try {
-                if (walWriter != null) {
-                    walWriter.close();
+                if (walWriter != null) walWriter.close();
+                List<LogEntry> remaining = new ArrayList<>(logQueue);
+                try (BufferedWriter w = new BufferedWriter(new FileWriter(walPath.toFile(), false))) {
+                    for (LogEntry e : remaining) {
+                        w.write(e.toWal());
+                        w.write('\n');
+                    }
+                    w.flush();
                 }
-                Files.write(walPath, new byte[0]);
                 walWriter = new BufferedWriter(new FileWriter(walPath.toFile(), true));
             } catch (IOException ex) {
-                getLogger().log(Level.SEVERE, "❌ Ошибка очистки WAL", ex);
+                getLogger().log(Level.SEVERE, "❌ Ошибка перезаписи WAL", ex);
             }
         }
     }
@@ -249,11 +248,9 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
     public void addLog(String name, String world, int x, int y, int z, String ob, String nb) {
         if (ob == null || nb == null) return;
         if (ob.equals(nb)) return;
-        if (ob.equals("minecraft:air") && nb.equals("minecraft:air")) return;
 
         LogEntry entry = new LogEntry(name, world, x, y, z, ob, nb, System.currentTimeMillis());
 
-        // WorldEdit batch
         if (worldEditBatchDepth.get() > 0) {
             batchBuffer.get().add(entry);
             worldEditTotalLogged.incrementAndGet();
@@ -263,21 +260,13 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
         enqueue(entry);
     }
 
-    /**
-     * Централизованная постановка в очередь с гарантией доставки:
-     *  1) пишем в WAL (на диск) — гарантия при краше
-     *  2) пишем в очередь в памяти
-     *  3) если очередь переполнена — форсим сброс в БД и ждём
-     */
     private void enqueue(LogEntry entry) {
         appendToWal(entry);
 
         if (queueSize.get() >= MAX_QUEUE) {
-            // Переполнение — принудительный сброс
             getLogger().warning("⚠️ Переполнение очереди, принудительный сброс...");
             flushQueueSafe();
 
-            // Если всё ещё переполнено — ждём
             int attempts = 0;
             while (queueSize.get() >= MAX_QUEUE && attempts < 200) {
                 try { Thread.sleep(50); } catch (InterruptedException ignored) {}
@@ -328,11 +317,7 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
     public long getTotalLoggedBlocks() { return totalLoggedBlocks.get(); }
     public long getTotalRolledBackBlocks() { return totalRolledBackBlocks.get(); }
 
-    // ==================== СЕРИАЛИЗАЦИЯ БЛОКОВ С NBT ====================
-    /**
-     * Формат: "NBT|<base64-encoded-nbt>" для контейнеров и т.п.
-     * Для обычных блоков — просто blockData.getAsString().
-     */
+    // ==================== СЕРИАЛИЗАЦИЯ ====================
     private String serializeBlock(Block block) {
         BlockData data = block.getBlockData();
         String base = data.getAsString();
@@ -340,36 +325,33 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
 
         if (state instanceof Container container) {
             try {
-                // Сохраняем NBT контейнера через Bukkit API
-                // Используем ItemsAdapter для сериализации содержимого
                 ItemStack[] contents = container.getInventory().getContents();
                 String nbt = serializeInventory(contents);
                 return "NBT|" + base + "|" + nbt;
             } catch (Throwable t) {
-                // Fallback на просто blockData
                 return base;
             }
         }
         return base;
     }
 
-    /**
-     * Восстанавливает блок с NBT.
-     */
     @SuppressWarnings("deprecation")
     private void deserializeAndPlace(World world, int x, int y, int z, String raw) {
         try {
+            if (raw == null || raw.isEmpty()) return;
+
             if (raw.startsWith("NBT|")) {
-                // Формат: NBT|<blockData>|<base64 inventory>
                 String[] parts = raw.split("\\|", 3);
                 if (parts.length < 3) {
-                    world.setBlockData(x, y, z, Bukkit.createBlockData(parts[1]));
+                    applyBlockData(world, x, y, z, parts.length >= 2 ? parts[1] : "minecraft:air");
                     return;
                 }
-                BlockData data = Bukkit.createBlockData(parts[1]);
-                world.setBlockData(x, y, z, data);
+                BlockData data = safeBlockData(parts[1]);
+                // Сначала ставим блок, потом восстанавливаем NBT
+                BlockState state1 = world.getBlockAt(x, y, z).getState();
+                state1.setBlockData(data);
+                state1.update(true, false); // force=true 强制覆盖，applyPhysics=false 试图抑制物理
 
-                // Восстанавливаем содержимое
                 Block block = world.getBlockAt(x, y, z);
                 BlockState state = block.getState();
                 if (state instanceof Container container) {
@@ -378,26 +360,37 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
                     container.update(true, false);
                 }
             } else {
-                BlockData data = blockDataCache.computeIfAbsent(raw, k -> {
-                    try { return Bukkit.createBlockData(k); }
-                    catch (IllegalArgumentException ex) {
-                        return Bukkit.createBlockData("minecraft:" + k);
-                    }
-                });
-                world.setBlockData(x, y, z, data);
+                applyBlockData(world, x, y, z, raw);
             }
         } catch (Exception ex) {
             getLogger().warning("Ошибка при установке блока " + raw + ": " + ex.getMessage());
         }
     }
 
-    /**
-     * Простая сериализация инвентаря через ItemStack#serializeAsBytes (Paper API).
-     * Если недоступно — используем Base64 от BukkitObjectOutputStream.
-     */
+    private void applyBlockData(World world, int x, int y, int z, String raw) {
+        BlockData data = safeBlockData(raw);
+        BlockState state = world.getBlockAt(x, y, z).getState();
+        state.setBlockData(data);
+        state.update(true, false);
+    }
+
+    private BlockData safeBlockData(String raw) {
+        return blockDataCache.computeIfAbsent(raw, k -> {
+            try {
+                return Bukkit.createBlockData(k);
+            } catch (IllegalArgumentException ex) {
+                try {
+                    return Bukkit.createBlockData("minecraft:" + k);
+                } catch (IllegalArgumentException ex2) {
+                    getLogger().warning("Неизвестный BlockData: " + k + " — использую air");
+                    return Bukkit.createBlockData(Material.AIR);
+                }
+            }
+        });
+    }
+
     private String serializeInventory(ItemStack[] contents) {
         try {
-            // Paper API
             try {
                 java.lang.reflect.Method m = ItemStack.class.getMethod("serializeAsBytes");
                 ByteArrayOutputStream baos = new ByteArrayOutputStream();
@@ -415,7 +408,6 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
                 dos.flush();
                 return Base64.getEncoder().encodeToString(baos.toByteArray());
             } catch (NoSuchMethodException nsme) {
-                // Fallback: BukkitObjectOutputStream
                 ByteArrayOutputStream baos = new ByteArrayOutputStream();
                 try (BukkitObjectOutputStream boos = new BukkitObjectOutputStream(baos)) {
                     boos.writeInt(contents.length);
@@ -433,7 +425,6 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
         if (base64 == null || base64.isEmpty()) return new ItemStack[0];
         try {
             byte[] raw = Base64.getDecoder().decode(base64);
-            // Пробуем Paper API
             try {
                 Class<?> clazz = Class.forName("org.bukkit.inventory.ItemStack");
                 java.lang.reflect.Method m = clazz.getMethod("deserializeBytes", byte[].class);
@@ -499,14 +490,14 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
                         if (batchCount > 0) {
                             ps.executeBatch();
                             conn.commit();
-                            // WAL можно очистить, т.к. данные в БД
-                            if (logQueue.isEmpty()) clearWal();
                         }
                     }
                 } catch (SQLException ex) {
                     getLogger().log(Level.SEVERE, "❌ Ошибка записи в БД (данные в WAL сохранены)", ex);
                 }
             }
+            // После коммита перезаписываем WAL только оставшимися записями
+            rewriteWal();
         } finally {
             isFlushing.set(false);
         }
@@ -540,7 +531,6 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
         String worldName = event.getWorld().getName();
 
         worldEditBatchDepth.incrementAndGet();
-        if (batchBuffer.get().isEmpty()) worldEditTotalLogged.set(0);
 
         event.setExtent(new AbstractDelegateExtent(event.getExtent()) {
             @Override
@@ -595,7 +585,7 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
                     while (rs.next()) {
                         found = true;
                         long ago = (System.currentTimeMillis() - rs.getLong("time")) / 1000 / 60;
-                        p.sendMessage(String.format("§e%s §7изменил на §f%s §8(%d мин. назад)",
+                        p.sendMessage(String.format("§e%s §7изменил §f%s §8(%d мин. назад)",
                                 rs.getString("player"),
                                 stripNbt(rs.getString("new_block")), ago));
                     }
@@ -617,7 +607,7 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
         return s;
     }
 
-    // ==================== БАЗОВЫЕ ИВЕНТЫ БЛОКОВ ====================
+    // ==================== БАЗОВЫЕ ИВЕНТЫ ====================
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onBreak(BlockBreakEvent e) {
         addLog(e.getPlayer().getName(), e.getBlock().getWorld().getName(),
@@ -653,7 +643,7 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
         }
     }
 
-    // ==================== КОНТЕЙНЕРЫ / СУНДУКИ ====================
+    // ==================== КОНТЕЙНЕРЫ ====================
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onInventoryOpen(InventoryOpenEvent e) {
         if (!(e.getPlayer() instanceof Player p)) return;
@@ -671,7 +661,6 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
         ContainerSession session = openContainers.remove(p.getUniqueId());
         if (session == null) return;
 
-        // Проверяем, изменился ли контейнер
         World world = Bukkit.getWorld(session.world);
         if (world == null) return;
         Block b = world.getBlockAt(session.x, session.y, session.z);
@@ -684,32 +673,9 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
         }
     }
 
-    /**
-     * Логируем клики по контейнеру — на случай, если игрок не закрывает инвентарь
-     * (краш, кик, выход). Обновляем снапшот в сессии.
-     */
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onInventoryClick(InventoryClickEvent e) {
-        if (!(e.getWhoClicked() instanceof Player p)) return;
-        if (!(e.getInventory().getHolder() instanceof Container container)) return;
-        ContainerSession session = openContainers.get(p.getUniqueId());
-        if (session == null) return;
-
-        Block b = container.getBlock();
-
-        // Планируем отложенную проверку (инвентарь ещё не обновился)
-        Bukkit.getAsyncScheduler().runDelayed(this, (task) -> {
-            Block currentBlock = b.getWorld().getBlockAt(b.getX(), b.getY(), b.getZ());
-            if (!(currentBlock.getState() instanceof Container)) return;
-            String current = serializeBlock(currentBlock);
-            if (!current.equals(session.snapshot)) {
-                // Логируем промежуточное изменение
-                addLog(session.player, session.world, session.x, session.y, session.z,
-                        session.snapshot, current);
-                // Обновляем снапшот
-                session.snapshot = current;
-            }
-        }, 1, TimeUnit.MILLISECONDS);
+        onInventoryClickInternal(e.getWhoClicked(), e.getInventory());
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -806,9 +772,10 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onBucketEmpty(PlayerBucketEmptyEvent e) {
         Block b = e.getBlock();
+        String fluid = e.getBucket() == Material.WATER_BUCKET ? "minecraft:water" : "minecraft:lava";
         addLog(e.getPlayer().getName(), b.getWorld().getName(),
                 b.getX(), b.getY(), b.getZ(),
-                b.getBlockData().getAsString(), "minecraft:water");
+                b.getBlockData().getAsString(), fluid);
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -819,7 +786,7 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
                 b.getBlockData().getAsString(), "minecraft:air");
     }
 
-    // ==================== РАМКИ / КАРТИНЫ ====================
+    // ==================== РАМКИ ====================
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onHangingBreak(HangingBreakEvent e) {
         if (e.getEntity() instanceof Player p) {
@@ -840,7 +807,7 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
                 "minecraft:air", "hanging:" + e.getEntity().getType().name());
     }
 
-    // ==================== ДРОП / ПОДБОР ====================
+    // ==================== ДРОП ====================
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onDrop(PlayerDropItemEvent e) {
         Item item = e.getItemDrop();
@@ -862,11 +829,9 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
                 "item:" + data, "minecraft:air");
     }
 
-    // ==================== СМЕРТЬ СУЩНОСТЕЙ (для важных) ====================
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onEntityDeath(EntityDeathEvent e) {
         LivingEntity entity = e.getEntity();
-        // Логируем только именованных / с кастомным именем / боссов
         if (!entity.getType().isAlive()) return;
         if (entity.getType() == EntityType.ARMOR_STAND) {
             Location loc = entity.getLocation();
@@ -876,54 +841,93 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
         }
     }
 
-    // ==================== РОЛЛБЕК ====================
-    private void handleRollback(Player p, int radius, long timeDelta) {
-        flushQueueSafe();
+    // ==================== РОЛЛБЕК (ИСПРАВЛЕНО) ====================
+    /**
+     * Логика отката:
+     *  1. Берём для каждого блока самую РАННЮЮ запись в диапазоне времени.
+     *  2. Значение old_block из этой записи — это состояние блока ДО первого изменения.
+     *     Именно его и нужно восстановить.
+     *
+     *  Пример: игрок поставил TNT-сферу и взорвал её.
+     *     запись 1: old=air, new=tnt   (поставил)
+     *     запись 2: old=tnt, new=air   (взрыв)
+     *     Самый ранний old_block = air  → откат убирает TNT. ✓
+     *
+     *  Пример: игрок сломал алмазный блок и поставил камень.
+     *     запись 1: old=almaз, new=air  (сломал)
+     *     запись 2: old=air,   new=stone (поставил)
+     *     Самый ранний old_block = алмаз → откат возвращает алмаз. ✓
+     */
+    private void handleRollback(Player p, int radiusChunks, long timeDelta) {
         forceFlushComplete();
 
         final World world = p.getWorld();
-        final long startTime = System.currentTimeMillis() - timeDelta;
-        final int centerX = p.getLocation().getBlockX();
-        final int centerZ = p.getLocation().getBlockZ();
-        final int minX = centerX - (radius << 4);
-        final int maxX = centerX + (radius << 4);
-        final int minZ = centerZ - (radius << 4);
-        final int maxZ = centerZ + (radius << 4);
+        final long endTime = System.currentTimeMillis();
+        final long startTime = endTime - timeDelta;
+        final Location center = p.getLocation();
+        final int centerX = center.getBlockX();
+        final int centerZ = center.getBlockZ();
 
-        p.sendMessage("§e[FR] Начинаю откат в радиусе " + radius + " чанков...");
-        p.sendMessage("§7Ищу изменения за " + formatTime(timeDelta) + "...");
+        // Радиус в блоках: radiusChunks * 16
+        final int radiusBlocks = radiusChunks * 16;
+        final int minX = centerX - radiusBlocks;
+        final int maxX = centerX + radiusBlocks;
+        final int minZ = centerZ - radiusBlocks;
+        final int maxZ = centerZ + radiusBlocks;
+
+        p.sendMessage("§e[FR] Откат: радиус " + radiusChunks + " чанков (" + radiusBlocks + " блоков)");
+        p.sendMessage("§7Период: с " + formatTime(timeDelta) + " назад по настоящее время");
+        p.sendMessage("§7Границы: X[" + minX + ".." + maxX + "] Z[" + minZ + ".." + maxZ + "]");
 
         Bukkit.getAsyncScheduler().runNow(this, (task) -> {
-            // Берём САМОЕ РАННЕЕ old_block для каждого блока
-            String query = "SELECT x, y, z, old_block, MIN(time) as first_time " +
-                    "FROM logs " +
-                    "WHERE world=? AND time > ? " +
-                    "AND x BETWEEN ? AND ? AND z BETWEEN ? AND ? " +
-                    "AND old_block != 'minecraft:air' " +
-                    "GROUP BY x, y, z ORDER BY first_time ASC";
+            // ВАЖНО: берём MIN(time) и old_block из этой записи.
+            // В SQLite это делается через подзапрос.
+            String query =
+                    "SELECT l.x, l.y, l.z, l.old_block " +
+                            "FROM logs l " +
+                            "INNER JOIN (" +
+                            "   SELECT x, y, z, MIN(time) AS mt " +
+                            "   FROM logs " +
+                            "   WHERE world=? AND time > ? AND time <= ? " +
+                            "   AND x BETWEEN ? AND ? AND z BETWEEN ? AND ? " +
+                            "   GROUP BY x, y, z" +
+                            ") sub ON l.x=sub.x AND l.y=sub.y AND l.z=sub.z AND l.time=sub.mt " +
+                            "WHERE l.world=? AND l.time > ? AND l.time <= ? " +
+                            "AND l.x BETWEEN ? AND ? AND l.z BETWEEN ? AND ?";
 
             List<BlockChange> changes = new ArrayList<>();
 
             synchronized (dbLock) {
                 try (Connection conn = dataSource.getConnection();
                      PreparedStatement ps = conn.prepareStatement(query)) {
-                    ps.setString(1, world.getName());
-                    ps.setLong(2, startTime);
-                    ps.setInt(3, minX);
-                    ps.setInt(4, maxX);
-                    ps.setInt(5, minZ);
-                    ps.setInt(6, maxZ);
+                    int i = 1;
+                    ps.setString(i++, world.getName());
+                    ps.setLong(i++, startTime);
+                    ps.setLong(i++, endTime);
+                    ps.setInt(i++, minX);
+                    ps.setInt(i++, maxX);
+                    ps.setInt(i++, minZ);
+                    ps.setInt(i++, maxZ);
+
+                    ps.setString(i++, world.getName());
+                    ps.setLong(i++, startTime);
+                    ps.setLong(i++, endTime);
+                    ps.setInt(i++, minX);
+                    ps.setInt(i++, maxX);
+                    ps.setInt(i++, minZ);
+                    ps.setInt(i, maxZ);
 
                     try (ResultSet rs = ps.executeQuery()) {
                         while (rs.next()) {
                             String oldBlock = rs.getString("old_block");
-                            if (oldBlock.equals("minecraft:air")) continue;
+                            if (oldBlock == null) continue;
                             changes.add(new BlockChange(
                                     rs.getInt("x"), rs.getInt("y"), rs.getInt("z"), oldBlock));
                         }
                     }
                 } catch (SQLException ex) {
                     p.sendMessage("§cОшибка при чтении из БД: " + ex.getMessage());
+                    getLogger().log(Level.SEVERE, "Rollback query error", ex);
                     return;
                 }
             }
@@ -945,9 +949,10 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
             changesByChunk.computeIfAbsent(key, k -> new ArrayList<>()).add(change);
         }
 
-        AtomicInteger totalApplied = new AtomicInteger(0);
-        AtomicInteger processedChunks = new AtomicInteger(0);
-        int totalChunks = changesByChunk.size();
+        final AtomicInteger totalApplied = new AtomicInteger(0);
+        final AtomicInteger processedChunks = new AtomicInteger(0);
+        final int totalChunks = changesByChunk.size();
+        final AtomicBoolean completed = new AtomicBoolean(false);
 
         p.sendMessage("§7Обработка " + totalChunks + " чанков...");
 
@@ -968,19 +973,20 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
                     }
                 }
 
-                int processed = processedChunks.incrementAndGet();
                 int applied = totalApplied.addAndGet(appliedInChunk);
+                int processed = processedChunks.incrementAndGet();
 
                 if (processed % 10 == 0 || processed == totalChunks) {
-                    int fp = processed, fa = applied;
                     Bukkit.getAsyncScheduler().runNow(FlorestRollback.this, (n) ->
-                            p.sendMessage("§7Прогресс: " + fp + "/" + totalChunks +
-                                    " чанков, применено: " + fa + " блоков"));
+                            p.sendMessage("§7Прогресс: " + processed + "/" + totalChunks +
+                                    " чанков, применено: " + applied + " блоков"));
                 }
 
-                if (processed == totalChunks) {
+                if (processed == totalChunks && completed.compareAndSet(false, true)) {
                     totalRolledBackBlocks.addAndGet(applied);
-                    p.sendMessage("§a[FR] Откат завершен! Восстановлено: " + applied);
+                    Bukkit.getAsyncScheduler().runNow(FlorestRollback.this, (n) -> {
+                        p.sendMessage("§a[FR] Откат завершен! Восстановлено: " + applied);
+                    });
                     getLogger().info("Роллбек: " + p.getName() +
                             ", восстановлено=" + applied + ", найдено=" + changes.size());
                 }
@@ -991,7 +997,7 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
     private void forceFlushComplete() {
         flushQueueSafe();
         int attempts = 0;
-        while (isFlushing.get() && attempts < 100) {
+        while (isFlushing.get() && attempts < 200) {
             try { Thread.sleep(50); attempts++; } catch (InterruptedException ignored) {}
         }
     }
@@ -1062,7 +1068,7 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
                 }
 
                 if (radius < 1 || radius > 50) {
-                    p.sendMessage("§cРадиус должен быть от 1 до 50");
+                    p.sendMessage("§cРадиус должен быть от 1 до 50 чанков");
                     return true;
                 }
 
@@ -1174,7 +1180,7 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
     private void sendHelp(Player p) {
         p.sendMessage("§6=== FlorestRollback Help ===");
         p.sendMessage("§e/fr rollback r:<радиус> t:<время> §7- Откатить изменения");
-        p.sendMessage("§e  §7Пример: §f/fr rollback r:10 t:1h");
+        p.sendMessage("§e  §7Радиус в ЧАНКАХ. Пример: §f/fr rollback r:10 t:1h");
         p.sendMessage("§e/fr inspect §7- Режим просмотра истории блока");
         p.sendMessage("§e/fr purge t:30d §7- Очистить старые записи");
         p.sendMessage("§e/fr stats §7- Показать статистику");
@@ -1195,7 +1201,6 @@ public final class FlorestRollback extends JavaPlugin implements Listener, Comma
     // ==================== DATA CLASSES ====================
     private record LogEntry(String player, String world, int x, int y, int z,
                             String oldB, String newB, long time) {
-        // WAL формат: player\x1Fworld\x1Fx\x1Fy\x1Fz\x1Fold\x1Fnew\x1Ftime
         String toWal() {
             return esc(player) + "\u001F" + esc(world) + "\u001F" + x + "\u001F" + y + "\u001F" + z +
                     "\u001F" + esc(oldB) + "\u001F" + esc(newB) + "\u001F" + time;
